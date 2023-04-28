@@ -16,6 +16,7 @@ from dependency.torpy.keyagreement import FastKeyAgreement, KeyAgreement, KeyAgr
 from dependency.torpy.utils import register_logger
 from dependency.torpy.circuit import random, TorCircuit, CircuitNode, NtorKeyAgreement
 from dependency.torpy.documents.network_status import RouterFlags
+from dependency.torpy.ext.stream import StreamState
 
 
 
@@ -122,18 +123,18 @@ def extend(circuit, node_router):
     key_agreement = node_extended.key_agreement  # See section 5.1.4 for full specification
 
     node_ID = key_agreement._fingerprint_bytes  # Server node's fingerprint
-    private_x = key_agreement._x.private_bytes_raw()  # Client's private key, x
-    public_X = key_agreement._X.public_bytes_raw()  # Client's public key, X
-    public_B = key_agreement._B.public_bytes_raw()  # Node's public "ntor onion" key, B
+    private_x = key_agreement._x._raw_private_bytes()  # Client's private key, x
+    public_X = key_agreement._X._raw_public_bytes()  # Client's public key, X
+    public_B = key_agreement._B._raw_public_bytes()  # Node's public "ntor onion" key, B
 
     # concatenation ID | B | X
-    onion_skin =  #your-code-here#
+    onion_skin =  node_ID + public_B + public_X
 
     # Build an EXTEND cell with the new node's info and our known keys
-    extend_cell =  #your-code-here#
+    extend_cell =  build_extend_cell(node_router, onion_skin)
 
     # Send EXTEND cell to the next node and receive an EXTENDED cell back
-    extended_cell =  #your-code-here#
+    extended_cell =  send_receive_cell_extend(extend_cell, circuit)
 
     # Meanwhile, the server at the new node generates a keypair of y,Y = KEYGEN(), and uses its ntor
     # onion private key, b, to compute H(H(X^y|X^b|ID|B|X|Y, t_verify)|ID|B|Y|X)
@@ -146,9 +147,9 @@ def extend(circuit, node_router):
     public_Y = extended_cell.handshake_data[:32]  # Node's public key, Y
     auth_digest = extended_cell.handshake_data[32:]
 
-    shared_X__y =  #your-code-here#
-    shared_X__b =  #your-code-here#
-    secret_input =  #your-code-here#
+    Xy = raise_exponent(public_Y, private_x)
+    Xb = raise_exponent(public_B, private_x)
+    secret_input = Xy + Xb
 
     # Complete the remaining hashing, verification - for further reference, read section 5.1.4 and 5.2.2.
     shared_secret = node_extended.complete_handshake(secret_input, public_Y, auth_digest)
@@ -162,9 +163,10 @@ def extend(circuit, node_router):
 def circuit_build_hops(circuit, middle_router, exit_router):
     logger.info('Building 3 hops circuit...')
 
-    #your-code-here#
+    extend(circuit, middle_router)
+    extend(circuit, exit_router)
 
-    logger.debug('Circuit has been built')
+    logger.info('Circuit has been built')
 
     return circuit
 
@@ -181,18 +183,18 @@ def circuit_from_guard(guard_router, circuit_id):
     # Then, we need to send it to the first node in the circuit we are trying to create here.
     # Note that TOR_DIGEST_LEN = HASH_LEN = 20 bytes
 
-    x =  #your-code-here#
+    x = random_bytes(TOR_DIGEST_LEN)
 
-    cell_create =  #your-code-here#
+    cell_create = build_create_cell(x, circuit_id)
 
-    cell_created =  #your-code-here#
+    cell_created = send_receive_cell_create(cell_create, circuit, circuit_node)
 
     # Extract the two parts from the received CREATED cell
     y = cell_created.handshake_data[:TOR_DIGEST_LEN]  # Key material (Y)
     key_hash = cell_created.handshake_data[TOR_DIGEST_LEN:]  # Derivative key data
 
     # Please reference 5.1.5 and 5.2.1 of the Tor protocol specification for how to compute K_0 before hashing.
-    k0 =  #your-code-here#
+    k0 = x+y
 
     k = kdf_tor(k0)
 
@@ -211,28 +213,43 @@ def circuit_from_guard(guard_router, circuit_id):
 def get(hostname, port, path="", guard_address=None, middle_address=None, exit_address=None):
     tor = TorClient()
 
-    # - Your code here - Pick nodes to form your circuit, an ID,
-    # and establish a layered connection between them. This is
-    # the Tor circuit that will be used to request a web page.
+    consensus = tor.consensus
 
-    #your-code-here#
+    if guard_address:
+        guard_router = router_from_ip(guard_address, consensus)
+    else:
+        guard_router = random_router(get_all_relays(consensus))
 
-    circuit_base =  #your-code-here#  # CREATE
+    if middle_address:
+        middle_router = router_from_ip(middle_address, consensus)
+    else:
+        middle_router = random_router(get_all_relays(consensus))
 
-    circuit =  #your-code-here#  # EXTEND
+    if exit_address:
+        exit_router = router_from_ip(exit_address, consensus)
+    else:
+        exit_router = random_router(get_all_exits(consensus))
 
-    # Use our established circuit to attach a TCP stream
+    circuit_id = gen_circuit_id()
+
+    circuit_base = circuit_from_guard(guard_router, circuit_id)
+    circuit = circuit_build_hops(circuit_base, middle_router, exit_router)
+
     port = port or 80
-    stream =  #your-code-here#  # BEGIN
+    stream = new_tcp_stream(circuit, hostname, port)
 
-    # Make an HTTP GET request to the web page at <hostname>:<port>/<path>
-    request =  #your-code-here#
-    logger.warning('Sending: %s %s:%s', request, hostname, port)
-    #your-code-here#
+    request_template = b'GET /%s HTTP/1.0\r\nHost: %s\r\n\r\n'
+    request = request_template % (path.encode(), hostname.encode())
+    recv = b""
 
-    logger.debug('Reading...')
-    recv =  #your-code-here#
-
+    with stream as stream:
+        logger.info("Sending request")
+        stream.send(request)
+        while stream.state == StreamState.Connected:
+            logger.info("Receiving data")
+            recv = recv + stream.recv(1024)
+            logger.info(f"Data received: {len(recv)} bytes")
+        logger.info("Stream closed")
     return recv.decode('utf-8')
 
 
